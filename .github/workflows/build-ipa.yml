@@ -13,7 +13,7 @@ on:
         default: ""
         type: string
       scheme:
-        description: "Optional Xcode scheme (auto-detected if exactly one app scheme is available)"
+        description: "Optional Xcode scheme (auto-detected if exactly one is available)"
         required: false
         default: ""
         type: string
@@ -49,9 +49,8 @@ jobs:
           set -euo pipefail
           git clone --depth 1 "https://github.com/$REPO.git" source
           cd source
-          # Convert common GitHub SSH submodule URLs to HTTPS.
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
-          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
           git submodule sync --recursive
           git submodule update --init --recursive --depth 1
 
@@ -71,9 +70,19 @@ jobs:
               exit 1
             fi
           else
-            # Ignore generated/dependency directories to avoid selecting nested projects.
-            mapfile -t WORKSPACES < <(find . -type d -name '*.xcworkspace'               -not -path '*/Pods/*' -not -path '*/Carthage/*'               -not -path '*/.build/*' -not -path '*/DerivedData/*' | sort)
-            mapfile -t PROJECTS < <(find . -type d -name '*.xcodeproj'               -not -path '*/Pods/*' -not -path '*/Carthage/*'               -not -path '*/.build/*' -not -path '*/DerivedData/*' | sort)
+            # Use Bash 3.2-compatible arrays (the default Bash on macOS).
+            WORKSPACES=()
+            PROJECTS=()
+            while IFS= read -r item; do WORKSPACES+=("$item"); done < <(
+              find . -type d -name '*.xcworkspace' \
+                -not -path '*/Pods/*' -not -path '*/Carthage/*' \
+                -not -path '*/.build/*' -not -path '*/DerivedData/*' | sort
+            )
+            while IFS= read -r item; do PROJECTS+=("$item"); done < <(
+              find . -type d -name '*.xcodeproj' \
+                -not -path '*/Pods/*' -not -path '*/Carthage/*' \
+                -not -path '*/.build/*' -not -path '*/DerivedData/*' | sort
+            )
 
             if [[ ${#WORKSPACES[@]} -eq 1 ]]; then
               PROJECT_PATH="${WORKSPACES[0]#./}"
@@ -114,7 +123,7 @@ jobs:
           root = data.get("workspace") or data.get("project") or {}
           schemes = root.get("schemes", [])
           if len(schemes) != 1:
-              print("ERROR: scheme non univoco; scheme disponibili: " + (", ".join(schemes) or "nessuno"), file=sys.stderr)
+              print("Scheme non univoco; disponibili: " + (", ".join(schemes) or "nessuno"), file=sys.stderr)
               sys.exit(2)
           print(schemes[0])
           PY
