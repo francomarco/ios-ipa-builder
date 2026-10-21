@@ -32,16 +32,31 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout source repository
+      - name: Checkout source and submodules
         env:
           REPO: ${{ inputs.repository }}
-        run: git clone --depth 1 "https://github.com/${REPO}.git" source
+        run: |
+          git clone --depth 1 "https://github.com/${REPO}.git" source
+          cd source
+          # Some older projects define submodules using SSH URLs.
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1
 
-      - name: Show Xcode schemes (diagnostic)
+      - name: Inspect Xcode project
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
         run: |
           cd source
-          find . -maxdepth 4 \( -name '*.xcodeproj' -o -name '*.xcworkspace' \) -print
           xcodebuild -version
+          if [[ "$PROJECT_PATH" == *.xcodeproj ]]; then
+            xcodebuild -list -project "$PROJECT_PATH"
+          elif [[ "$PROJECT_PATH" == *.xcworkspace ]]; then
+            xcodebuild -list -workspace "$PROJECT_PATH"
+          else
+            echo "project_path must end in .xcodeproj or .xcworkspace"
+            exit 1
+          fi
 
       - name: Build app for device (unsigned)
         env:
@@ -51,11 +66,8 @@ jobs:
           cd source
           if [[ "$PROJECT_PATH" == *.xcworkspace ]]; then
             PROJECT_ARG=(-workspace "$PROJECT_PATH")
-          elif [[ "$PROJECT_PATH" == *.xcodeproj ]]; then
-            PROJECT_ARG=(-project "$PROJECT_PATH")
           else
-            echo "project_path must end in .xcodeproj or .xcworkspace"
-            exit 1
+            PROJECT_ARG=(-project "$PROJECT_PATH")
           fi
 
           xcodebuild "${PROJECT_ARG[@]}" \
@@ -64,8 +76,7 @@ jobs:
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            build
+            CODE_SIGNING_ALLOWED=NO             build
 
       - name: Package unsigned IPA
         run: |
