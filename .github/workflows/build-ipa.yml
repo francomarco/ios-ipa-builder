@@ -4,16 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       repository:
-        description: "GitHub repository in owner/name format"
+        description: "GitHub repository URL or owner/name"
         required: true
         type: string
       project_path:
-        description: "Relative path to .xcodeproj or .xcworkspace"
-        required: true
+        description: "Optional path to .xcodeproj or .xcworkspace (auto-detected if blank)"
+        required: false
+        default: ""
         type: string
       scheme:
-        description: "Xcode scheme name"
-        required: true
+        description: "Optional Xcode scheme (auto-detected if exactly one app scheme is available)"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -23,46 +25,116 @@ jobs:
   build:
     runs-on: macos-15
     steps:
-      - name: Validate repository input
+      - name: Normalize and validate repository input
+        id: repo
         env:
-          REPO: ${{ inputs.repository }}
+          REPO_INPUT: ${{ inputs.repository }}
         run: |
+          set -euo pipefail
+          REPO="$REPO_INPUT"
+          REPO="${REPO#https://github.com/}"
+          REPO="${REPO#http://github.com/}"
+          REPO="${REPO%.git}"
+          REPO="${REPO%/}"
           if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            echo "Invalid repository. Use owner/name."
+            echo "::error::Inserisci un URL GitHub pubblico oppure owner/name."
             exit 1
           fi
+          echo "repository=$REPO" >> "$GITHUB_OUTPUT"
 
       - name: Checkout source and submodules
         env:
-          REPO: ${{ inputs.repository }}
+          REPO: ${{ steps.repo.outputs.repository }}
         run: |
-          git clone --depth 1 "https://github.com/${REPO}.git" source
+          set -euo pipefail
+          git clone --depth 1 "https://github.com/$REPO.git" source
           cd source
-          # Some older projects define submodules using SSH URLs.
+          # Convert common GitHub SSH submodule URLs to HTTPS.
           git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           git submodule sync --recursive
           git submodule update --init --recursive --depth 1
 
-      - name: Inspect Xcode project
+      - name: Detect Xcode project and scheme
+        id: detect
         env:
-          PROJECT_PATH: ${{ inputs.project_path }}
+          PROJECT_INPUT: ${{ inputs.project_path }}
+          SCHEME_INPUT: ${{ inputs.scheme }}
         run: |
+          set -euo pipefail
           cd source
-          xcodebuild -version
-          if [[ "$PROJECT_PATH" == *.xcodeproj ]]; then
-            xcodebuild -list -project "$PROJECT_PATH"
-          elif [[ "$PROJECT_PATH" == *.xcworkspace ]]; then
-            xcodebuild -list -workspace "$PROJECT_PATH"
+
+          if [[ -n "$PROJECT_INPUT" ]]; then
+            PROJECT_PATH="$PROJECT_INPUT"
+            if [[ ! -e "$PROJECT_PATH" ]]; then
+              echo "::error::Il percorso indicato non esiste: $PROJECT_PATH"
+              exit 1
+            fi
           else
-            echo "project_path must end in .xcodeproj or .xcworkspace"
+            # Ignore generated/dependency directories to avoid selecting nested projects.
+            mapfile -t WORKSPACES < <(find . -type d -name '*.xcworkspace'               -not -path '*/Pods/*' -not -path '*/Carthage/*'               -not -path '*/.build/*' -not -path '*/DerivedData/*' | sort)
+            mapfile -t PROJECTS < <(find . -type d -name '*.xcodeproj'               -not -path '*/Pods/*' -not -path '*/Carthage/*'               -not -path '*/.build/*' -not -path '*/DerivedData/*' | sort)
+
+            if [[ ${#WORKSPACES[@]} -eq 1 ]]; then
+              PROJECT_PATH="${WORKSPACES[0]#./}"
+            elif [[ ${#WORKSPACES[@]} -gt 1 ]]; then
+              echo "::error::Trovati più workspace. Specifica project_path manualmente:"
+              printf '%s\n' "${WORKSPACES[@]}"
+              exit 1
+            elif [[ ${#PROJECTS[@]} -eq 1 ]]; then
+              PROJECT_PATH="${PROJECTS[0]#./}"
+            elif [[ ${#PROJECTS[@]} -gt 1 ]]; then
+              echo "::error::Trovati più progetti Xcode. Specifica project_path manualmente:"
+              printf '%s\n' "${PROJECTS[@]}"
+              exit 1
+            else
+              echo "::error::Non ho trovato file .xcodeproj o .xcworkspace. Il progetto potrebbe richiedere XcodeGen, Tuist o un altro sistema di generazione."
+              exit 1
+            fi
+          fi
+
+          if [[ "$PROJECT_PATH" == *.xcworkspace ]]; then
+            LIST_JSON="$(xcodebuild -list -json -workspace "$PROJECT_PATH")"
+          elif [[ "$PROJECT_PATH" == *.xcodeproj ]]; then
+            LIST_JSON="$(xcodebuild -list -json -project "$PROJECT_PATH")"
+          else
+            echo "::error::project_path deve indicare un file .xcodeproj o .xcworkspace."
             exit 1
           fi
 
+          printf '%s\n' "$LIST_JSON" > "$RUNNER_TEMP/xcode-list.json"
+
+          if [[ -n "$SCHEME_INPUT" ]]; then
+            SCHEME="$SCHEME_INPUT"
+          else
+            SCHEME="$(python3 - <<'PY'
+          import json, os, sys
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "xcode-list.json")) as f:
+              data = json.load(f)
+          root = data.get("workspace") or data.get("project") or {}
+          schemes = root.get("schemes", [])
+          if len(schemes) != 1:
+              print("ERROR: scheme non univoco; scheme disponibili: " + (", ".join(schemes) or "nessuno"), file=sys.stderr)
+              sys.exit(2)
+          print(schemes[0])
+          PY
+          )" || {
+            echo "::error::Impossibile scegliere automaticamente uno scheme. Inserisci il nome del scheme nel campo opzionale."
+            exit 1
+          }
+          fi
+
+          echo "project_path=$PROJECT_PATH" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "Progetto selezionato: $PROJECT_PATH"
+          echo "Scheme selezionato: $SCHEME"
+
       - name: Build app for device (unsigned)
         env:
-          PROJECT_PATH: ${{ inputs.project_path }}
-          SCHEME: ${{ inputs.scheme }}
+          PROJECT_PATH: ${{ steps.detect.outputs.project_path }}
+          SCHEME: ${{ steps.detect.outputs.scheme }}
         run: |
+          set -euo pipefail
           cd source
           if [[ "$PROJECT_PATH" == *.xcworkspace ]]; then
             PROJECT_ARG=(-workspace "$PROJECT_PATH")
@@ -70,20 +142,23 @@ jobs:
             PROJECT_ARG=(-project "$PROJECT_PATH")
           fi
 
+          set -o pipefail
           xcodebuild "${PROJECT_ARG[@]}" \
             -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
-            CODE_SIGNING_ALLOWED=NO             build
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
 
       - name: Package unsigned IPA
         run: |
+          set -euo pipefail
           APP_DIR="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos"
           APP="$(find "$APP_DIR" -maxdepth 1 -type d -name '*.app' ! -name '*Tests.app' -print -quit)"
           if [[ -z "$APP" ]]; then
-            echo "No .app found in $APP_DIR"
+            echo "::error::Nessuna app .app trovata in $APP_DIR"
             exit 1
           fi
           mkdir -p "$RUNNER_TEMP/package/Payload"
