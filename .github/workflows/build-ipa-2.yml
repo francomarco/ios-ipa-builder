@@ -1,0 +1,120 @@
+name: Build iOS IPA 2
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "GitHub repository URL or owner/name"
+        required: true
+        type: string
+      project_path:
+        description: "Exact path to .xcodeproj or .xcworkspace"
+        required: true
+        type: string
+      scheme:
+        description: "Exact Xcode scheme to build"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Normalize and validate repository input
+        id: repo
+        env:
+          REPO_INPUT: ${{ inputs.repository }}
+        run: |
+          set -euo pipefail
+          REPO="$REPO_INPUT"
+          REPO="${REPO#https://github.com/}"
+          REPO="${REPO#http://github.com/}"
+          REPO="${REPO%%\?*}"
+          REPO="${REPO%%\#*}"
+          REPO="${REPO%.git}"
+          REPO="${REPO%/}"
+          if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Inserisci un URL GitHub pubblico oppure owner/name."
+            exit 1
+          fi
+          echo "repository=$REPO" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout source and submodules
+        env:
+          REPO: ${{ steps.repo.outputs.repository }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "https://github.com/$REPO.git" source
+          cd source
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1
+
+      - name: Validate project path and scheme
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+          SCHEME: ${{ inputs.scheme }}
+        run: |
+          set -euo pipefail
+          cd source
+          if [[ ! -e "$PROJECT_PATH" ]]; then
+            echo "::error::Il percorso indicato non esiste nel repository: $PROJECT_PATH"
+            exit 1
+          fi
+          if [[ "$PROJECT_PATH" == *.xcworkspace ]]; then
+            xcodebuild -list -workspace "$PROJECT_PATH"
+          elif [[ "$PROJECT_PATH" == *.xcodeproj ]]; then
+            xcodebuild -list -project "$PROJECT_PATH"
+          else
+            echo "::error::project_path deve terminare con .xcodeproj oppure .xcworkspace."
+            exit 1
+          fi
+
+      - name: Build app for device (unsigned)
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+          SCHEME: ${{ inputs.scheme }}
+        run: |
+          set -euo pipefail
+          cd source
+          if [[ "$PROJECT_PATH" == *.xcworkspace ]]; then
+            PROJECT_ARG=(-workspace "$PROJECT_PATH")
+          else
+            PROJECT_ARG=(-project "$PROJECT_PATH")
+          fi
+
+          set -o pipefail
+          xcodebuild "${PROJECT_ARG[@]}" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP_DIR="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos"
+          APP="$(find "$APP_DIR" -maxdepth 1 -type d -name '*.app' ! -name '*Tests.app' -print -quit)"
+          if [[ -z "$APP" ]]; then
+            echo "::error::Nessuna app .app trovata in $APP_DIR"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/package/Payload"
+          ditto "$APP" "$RUNNER_TEMP/package/Payload/$(basename "$APP")"
+          cd "$RUNNER_TEMP/package"
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/app-unsigned.ipa" Payload
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ios-ipa
+          path: app-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 3
